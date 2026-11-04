@@ -176,6 +176,7 @@ fn merge_media_group(members: Vec<TaggedMediaItem>, group_id: &str) -> MediaItem
         .sum::<i64>()
         .min(i32::MAX as i64) as i32;
 
+    let user_data = merged_user_data(&members);
     let mut best = members
         .into_iter()
         .max_by(|left, right| {
@@ -196,7 +197,54 @@ fn merge_media_group(members: Vec<TaggedMediaItem>, group_id: &str) -> MediaItem
     if advertises_versions {
         best.item.media_source_count = Some(media_source_count);
     }
+    if let Some(mut user_data) = user_data {
+        if let Some(own) = best.item.user_data.as_ref() {
+            user_data.key = own.key.clone();
+            user_data.item_id = own.item_id.clone();
+        }
+        best.item.user_data = Some(user_data);
+    }
     best.item
+}
+
+/// Watch state lives on whichever backend the viewer last played a version
+/// on. The collapsed entry carries the most recently played member's state
+/// (progress, played flag, last-played date) so Continue Watching resumes at
+/// the right position and sorts by the real last-played time, independent of
+/// which server is the playback representative.
+fn merged_user_data(members: &[TaggedMediaItem]) -> Option<crate::models::UserData> {
+    let latest = members
+        .iter()
+        .filter_map(|member| member.item.user_data.as_ref())
+        .filter(|data| data.last_played_date.is_some())
+        .max_by(|left, right| {
+            compare_played_dates(
+                left.last_played_date.as_deref(),
+                right.last_played_date.as_deref(),
+            )
+        })?;
+    let mut merged = latest.clone();
+    merged.is_favorite = members.iter().any(|member| {
+        member
+            .item
+            .user_data
+            .as_ref()
+            .is_some_and(|data| data.is_favorite)
+    });
+    Some(merged)
+}
+
+fn compare_played_dates(left: Option<&str>, right: Option<&str>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => match (
+            chrono::DateTime::parse_from_rfc3339(left),
+            chrono::DateTime::parse_from_rfc3339(right),
+        ) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            _ => left.cmp(right),
+        },
+        _ => left.cmp(&right),
+    }
 }
 
 pub fn label_duplicates(items: Vec<TaggedMediaItem>) -> Vec<MediaItem> {
@@ -730,6 +778,72 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].id, "aggregate-id");
         assert_eq!(merged[0].media_source_count, Some(2));
+    }
+
+    #[test]
+    fn collapsed_versions_carry_the_most_recently_played_watch_state() {
+        let with_user_data = |server_id, priority, id: &str, data: serde_json::Value| {
+            let mut tagged = typed_tagged(server_id, priority, id, "Episode", "ep-9");
+            tagged.item.user_data = Some(serde_json::from_value(data).unwrap());
+            tagged
+        };
+        for (first_priority, second_priority) in [(100, 1), (1, 100)] {
+            let plan = MediaDedupPlan::new(vec![
+                with_user_data(
+                    1,
+                    first_priority,
+                    "older",
+                    serde_json::json!({
+                        "PlaybackPositionTicks": 100, "PlayCount": 1, "IsFavorite": true,
+                        "Played": false, "Key": "older-key", "ItemId": "older",
+                        "LastPlayedDate": "2026-10-01T20:00:00.0000000Z"
+                    }),
+                ),
+                with_user_data(
+                    2,
+                    second_priority,
+                    "newer",
+                    serde_json::json!({
+                        "PlaybackPositionTicks": 500, "PlayCount": 2, "IsFavorite": false,
+                        "Played": false, "Key": "newer-key", "ItemId": "newer",
+                        "LastPlayedDate": "2026-11-01T20:00:00.0000000+00:00"
+                    }),
+                ),
+            ]);
+            let merged = plan.collapse(&assignments(&["older", "newer"], 2));
+            assert_eq!(merged.len(), 1);
+            let data = merged[0].user_data.as_ref().unwrap();
+            assert_eq!(data.playback_position_ticks, 500);
+            assert_eq!(data.play_count, 2);
+            assert!(
+                data.is_favorite,
+                "a favorite on any server stays a favorite"
+            );
+            // Identity fields stay with the representative item.
+            let representative = if first_priority > second_priority {
+                "older"
+            } else {
+                "newer"
+            };
+            assert_eq!(data.item_id, representative);
+            assert_eq!(data.key, format!("{representative}-key"));
+        }
+    }
+
+    #[test]
+    fn collapsed_versions_without_play_history_keep_the_representative_state() {
+        let mut first = typed_tagged(1, 100, "first", "Episode", "ep-9");
+        first.item.user_data = Some(
+            serde_json::from_value(serde_json::json!({
+                "PlaybackPositionTicks": 0, "PlayCount": 0, "IsFavorite": false,
+                "Played": false, "Key": "first-key", "ItemId": "first"
+            }))
+            .unwrap(),
+        );
+        let second = typed_tagged(2, 1, "second", "Episode", "ep-9");
+        let merged = MediaDedupPlan::new(vec![first, second])
+            .collapse(&assignments(&["first", "second"], 2));
+        assert_eq!(merged[0].user_data.as_ref().unwrap().key, "first-key");
     }
 
     #[test]

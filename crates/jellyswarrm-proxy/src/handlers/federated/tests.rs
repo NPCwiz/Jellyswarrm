@@ -1542,8 +1542,7 @@ async fn latest_preserves_unknown_identity_and_disabled_behavior() {
             .unwrap(),
         CatalogPlan::Interleaved(_)
     ));
-    state.config.write().await.deduplicate_media = true;
-    for path in ["/Items", "/UserItems/Resume", "/Items/Suggestions"] {
+    for path in ["/UserItems/Resume", "/Shows/NextUp"] {
         assert!(matches!(
             resolve_catalog_plan(&state, &request(path, &sessions))
                 .await
@@ -1551,4 +1550,252 @@ async fn latest_preserves_unknown_identity_and_disabled_behavior() {
             CatalogPlan::Interleaved(_)
         ));
     }
+    state.config.write().await.deduplicate_media = true;
+    for path in ["/Items", "/Items/Suggestions"] {
+        assert!(matches!(
+            resolve_catalog_plan(&state, &request(path, &sessions))
+                .await
+                .unwrap(),
+            CatalogPlan::Interleaved(_)
+        ));
+    }
+    for (path, expected_scope) in [
+        ("/UserItems/Resume", "resume:viewer:"),
+        ("/Users/viewer/Items/Resume/", "resume:viewer:"),
+        ("/Shows/NextUp?UserId=viewer", "nextup:viewer:"),
+    ] {
+        let CatalogPlan::Virtual {
+            catalog_scope_key, ..
+        } = resolve_catalog_plan(&state, &request(path, &sessions))
+            .await
+            .unwrap()
+        else {
+            panic!("{path} must merge across servers");
+        };
+        assert_eq!(catalog_scope_key, expected_scope, "{path}");
+    }
+}
+
+async fn register_matched_series(
+    state: &AppState,
+    sessions: &[(AuthorizationSession, Server)],
+    upstreams: &[MockServer],
+) -> Value {
+    use super::{
+        library_resolution::CatalogFetchTarget, media_reconciliation::get_virtual_library_items,
+    };
+    for upstream in upstreams {
+        Mock::given(method("GET"))
+            .and(path("/Items"))
+            .and(query_param("IncludeItemTypes", "Series"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Items": [{"Id": "show", "Type": "Series", "Name": "Show",
+                           "ProviderIds": {"Tvdb": "81189"}}],
+                "TotalRecordCount": 1, "StartIndex": 0
+            })))
+            .mount(upstream)
+            .await;
+    }
+    let targets = sessions
+        .iter()
+        .map(|(session, server)| CatalogFetchTarget {
+            session: session.clone(),
+            server: server.clone(),
+            parent_id: None,
+            resolved_parent_id: None,
+        })
+        .collect();
+    let Json(series) = get_virtual_library_items(
+        state,
+        request("/Items?IncludeItemTypes=Series", sessions),
+        "configured:shows:viewer".into(),
+        targets,
+        0,
+    )
+    .await
+    .unwrap();
+    assert_eq!(series["Items"].as_array().unwrap().len(), 1);
+    series["Items"][0]["Id"].clone()
+}
+
+fn episode(id: &str, series: &str, season: i64, number: i64, tvdb: &str) -> Value {
+    json!({
+        "Id": id, "Name": format!("S{season}E{number}"), "Type": "Episode",
+        "SeriesId": series, "SeriesName": "Show",
+        "ParentIndexNumber": season, "IndexNumber": number,
+        "ProviderIds": {"Tvdb": tvdb}
+    })
+}
+
+#[tokio::test]
+async fn next_up_shows_one_entry_per_matched_show_at_the_furthest_episode() {
+    let (state, _pool, sessions, upstreams) = setup().await;
+    let show_id = register_matched_series(&state, &sessions, &upstreams).await;
+    // Server 0 has watch history up to S1E2; server 1 up to S1E9. Each backend
+    // also has an unrelated show the other one does not know about.
+    for (upstream, items) in upstreams.iter().zip([
+        json!([
+            episode("s1e3", "show", 1, 3, "303"),
+            episode("solo-a", "other-a", 1, 1, "900")
+        ]),
+        json!([
+            episode("s2e1", "show", 2, 1, "401"),
+            episode("solo-b", "other-b", 4, 2, "901")
+        ]),
+    ]) {
+        Mock::given(method("GET"))
+            .and(path("/Shows/NextUp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Items": items, "TotalRecordCount": 2, "StartIndex": 0
+            })))
+            .mount(upstream)
+            .await;
+    }
+    let Json(response) = get_items_from_all_servers_if_not_restricted(
+        State(state.clone()),
+        Preprocessed(request("/Shows/NextUp?UserId=viewer&Limit=10", &sessions)),
+    )
+    .await
+    .unwrap();
+    let items = response["Items"].as_array().unwrap();
+    let names = items
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    // The matched show keeps its first rank but shows the furthest episode;
+    // the unmatched shows are untouched and stay in interleaved upstream order.
+    assert_eq!(names, vec!["S2E1", "S1E1", "S4E2"], "{response}");
+    assert_eq!(response["TotalRecordCount"], 3);
+    let show = state
+        .media_storage
+        .get_media_parent_group_id(items[1]["SeriesId"].as_str().unwrap(), "viewer")
+        .await
+        .unwrap();
+    assert!(
+        show.is_none(),
+        "unmatched shows keep server-local series IDs"
+    );
+    assert_eq!(
+        items[0]["SeriesId"], show_id,
+        "the kept episode links to the merged show"
+    );
+
+    for upstream in &upstreams {
+        for received in upstream.received_requests().await.unwrap() {
+            if received.url.path() != "/Shows/NextUp" {
+                continue;
+            }
+            let fields = received
+                .url
+                .query_pairs()
+                .find(|(key, _)| key == "Fields")
+                .map(|(_, value)| value.into_owned())
+                .unwrap_or_default();
+            assert!(
+                fields.split(',').any(|field| field == "ProviderIds"),
+                "{fields}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn next_up_merges_the_same_episode_into_one_selectable_entry() {
+    let (state, _pool, sessions, upstreams) = setup().await;
+    register_matched_series(&state, &sessions, &upstreams).await;
+    for upstream in &upstreams {
+        Mock::given(method("GET"))
+            .and(path("/Shows/NextUp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Items": [episode("s1e3", "show", 1, 3, "303")],
+                "TotalRecordCount": 1, "StartIndex": 0
+            })))
+            .mount(upstream)
+            .await;
+    }
+    let mut first_id = None;
+    for _ in 0..2 {
+        let Json(response) = get_items_from_all_servers_if_not_restricted(
+            State(state.clone()),
+            Preprocessed(request("/Shows/NextUp?Limit=10", &sessions)),
+        )
+        .await
+        .unwrap();
+        let items = response["Items"].as_array().unwrap();
+        assert_eq!(items.len(), 1, "{response}");
+        assert_eq!(
+            items[0]["Name"], "S1E3",
+            "no [server] suffix on a merged entry"
+        );
+        assert_eq!(items[0]["MediaSourceCount"], 2);
+        let id = items[0]["Id"].as_str().unwrap().to_string();
+        let members = state
+            .media_storage
+            .get_media_version_members_by_virtual_id(&id)
+            .await
+            .unwrap();
+        assert_eq!(members.len(), 2);
+        if let Some(first_id) = &first_id {
+            assert_eq!(&id, first_id, "the merged entry keeps a stable ID");
+        }
+        first_id = Some(id);
+    }
+}
+
+#[tokio::test]
+async fn continue_watching_merges_versions_and_resumes_from_the_latest_progress() {
+    let (state, _pool, sessions, upstreams) = setup().await;
+    let movie = |position: i64, played: &str| {
+        json!({
+            "Id": "movie", "Name": "Movie", "Type": "Movie", "ProviderIds": {"Tmdb": "42"},
+            "UserData": {
+                "PlaybackPositionTicks": position, "PlayCount": 1, "IsFavorite": false,
+                "Played": false, "Key": "42", "ItemId": "movie", "LastPlayedDate": played
+            }
+        })
+    };
+    let other = json!({
+        "Id": "other", "Name": "Other", "Type": "Movie", "ProviderIds": {"Tmdb": "7"},
+        "UserData": {
+            "PlaybackPositionTicks": 9, "PlayCount": 1, "IsFavorite": false,
+            "Played": false, "Key": "7", "ItemId": "other",
+            "LastPlayedDate": "2026-10-15T20:00:00.0000000Z"
+        }
+    });
+    for (upstream, items) in upstreams.iter().zip([
+        json!([movie(100, "2026-10-01T20:00:00.0000000Z"), other]),
+        json!([movie(5_000, "2026-11-01T20:00:00.0000000Z")]),
+    ]) {
+        Mock::given(method("GET"))
+            .and(path("/UserItems/Resume"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Items": items, "TotalRecordCount": 2, "StartIndex": 0
+            })))
+            .mount(upstream)
+            .await;
+    }
+    let Json(response) = get_items_from_all_servers(
+        State(state.clone()),
+        Preprocessed(request(
+            "/UserItems/Resume?Limit=12&MediaTypes=Video",
+            &sessions,
+        )),
+    )
+    .await
+    .unwrap();
+    let items = response["Items"].as_array().unwrap();
+    let names = items
+        .iter()
+        .map(|item| item["Name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    // One entry for the movie, ordered by its real (latest) last-played date.
+    assert_eq!(names, vec!["Movie", "Other"], "{response}");
+    assert_eq!(items[0]["MediaSourceCount"], 2);
+    assert_eq!(items[0]["UserData"]["PlaybackPositionTicks"], 5_000);
+    let members = state
+        .media_storage
+        .get_media_version_members_by_virtual_id(items[0]["Id"].as_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(members.len(), 2);
 }

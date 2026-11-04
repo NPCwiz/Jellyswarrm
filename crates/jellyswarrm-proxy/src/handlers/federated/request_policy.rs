@@ -42,7 +42,40 @@ pub(super) fn has_query_key(url: &url::Url, keys: &[&str]) -> bool {
 
 pub(super) fn is_upstream_limited_catalog_request(url: &url::Url) -> bool {
     let path = url.path().to_ascii_lowercase();
-    path.contains("/latest") || path.contains("/suggestions")
+    path.contains("/latest") || path.contains("/suggestions") || watch_feed(url).is_some()
+}
+
+/// Per-viewer home feeds. Each is additive (never an inventory) and is ranked
+/// by the upstream, so it is fetched once per server with the client window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WatchFeed {
+    Latest,
+    NextUp,
+    Resume,
+}
+
+impl WatchFeed {
+    /// Prefix of the persisted catalog scope key (`{prefix}:{viewer}:{parent}`).
+    pub(super) fn scope_prefix(self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::NextUp => "nextup",
+            Self::Resume => "resume",
+        }
+    }
+}
+
+pub(super) fn watch_feed(url: &url::Url) -> Option<WatchFeed> {
+    let path = url.path().trim_end_matches('/').to_ascii_lowercase();
+    if path.ends_with("/latest") {
+        Some(WatchFeed::Latest)
+    } else if path.ends_with("/shows/nextup") {
+        Some(WatchFeed::NextUp)
+    } else if path.ends_with("/items/resume") || path.ends_with("/useritems/resume") {
+        Some(WatchFeed::Resume)
+    } else {
+        None
+    }
 }
 
 pub(super) fn is_authoritative_media_inventory_request(url: &url::Url) -> bool {

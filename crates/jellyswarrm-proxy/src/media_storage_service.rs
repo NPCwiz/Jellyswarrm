@@ -969,16 +969,7 @@ impl MediaStorageService {
         let mut active_member_ids = HashSet::new();
         for row in rows {
             let key: String = row.try_get("scope_key")?;
-            let mut parts = key.splitn(3, ':');
-            let kind = parts.next();
-            let middle = parts.next();
-            let last = parts.next();
-            let applicable = match kind {
-                Some("configured" | "automatic" | "aggregate") => last == Some(viewer),
-                Some("latest") => middle == Some(viewer) && last.is_some(),
-                _ => false,
-            };
-            if !applicable {
+            if !scope_applies_to_viewer(&key, viewer) {
                 continue;
             }
             let group = Self::media_version_group_from_row(&row)?;
@@ -1026,15 +1017,7 @@ impl MediaStorageService {
         let mut active_ids = HashSet::new();
         for row in rows {
             let key: String = row.try_get("scope_key")?;
-            let mut parts = key.splitn(3, ':');
-            let kind = parts.next();
-            let middle = parts.next();
-            let last = parts.next();
-            if !match kind {
-                Some("configured" | "automatic" | "aggregate") => last == Some(viewer),
-                Some("latest") => middle == Some(viewer) && last.is_some(),
-                _ => false,
-            } {
+            if !scope_applies_to_viewer(&key, viewer) {
                 continue;
             }
             let members = self.get_media_version_members(row.try_get("id")?).await?;
@@ -1402,6 +1385,21 @@ impl MediaStorageService {
         self.original_mapping_cache.invalidate_all();
         self.mapping_with_server_cache.invalidate_all();
         Ok(deleted_count)
+    }
+}
+
+/// Browse scopes end with the viewer (`configured|automatic|aggregate:<x>:<viewer>`).
+/// Home feeds (Latest, Next Up, Continue Watching) put the viewer in the middle
+/// (`latest|nextup|resume:<viewer>:<parent>`, parent possibly empty).
+fn scope_applies_to_viewer(scope_key: &str, viewer: &str) -> bool {
+    let mut parts = scope_key.splitn(3, ':');
+    let kind = parts.next();
+    let middle = parts.next();
+    let last = parts.next();
+    match kind {
+        Some("configured" | "automatic" | "aggregate") => last == Some(viewer),
+        Some("latest" | "nextup" | "resume") => middle == Some(viewer) && last.is_some(),
+        _ => false,
     }
 }
 

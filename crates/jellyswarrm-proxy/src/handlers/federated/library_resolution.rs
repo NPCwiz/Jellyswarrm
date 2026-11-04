@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use hyper::StatusCode;
 use tracing::{debug, error};
 
+use super::request_policy::watch_feed;
 use crate::{
     request_preprocessing::PreprocessedRequest,
     server_storage::Server,
@@ -139,25 +140,24 @@ pub(super) async fn resolve_catalog_plan(
         })
         .collect();
 
-    if preprocessed
-        .original_request
-        .url()
-        .path()
-        .to_ascii_lowercase()
-        .ends_with("/latest")
-        && state.deduplicate_media_enabled().await
-    {
+    if let Some(feed) = watch_feed(preprocessed.original_request.url()) {
+        if !state.deduplicate_media_enabled().await {
+            return Ok(CatalogPlan::Interleaved(targets));
+        }
         let viewer = preprocessed
             .access_scope
             .as_ref()
             .map(|scope| scope.user_id())
             .or_else(|| preprocessed.user.as_ref().map(|user| user.id.as_str()))
             .ok_or(StatusCode::UNAUTHORIZED)?;
-        // Latest is an additive feed, not an inventory. Keep its identity scope
-        // stable across windows, endpoint aliases and temporarily missing sessions.
+        // Latest, Next Up and Continue Watching are additive feeds, not
+        // inventories. Keep each identity scope stable across windows, endpoint
+        // aliases and temporarily missing sessions, so the same episode or movie
+        // seen on several servers collapses into one selectable entry.
         return Ok(CatalogPlan::Virtual {
             catalog_scope_key: format!(
-                "latest:{viewer}:{}",
+                "{}:{viewer}:{}",
+                feed.scope_prefix(),
                 parent_id(preprocessed.original_request.url())
                     .map(|id| normalize_library_id(&id))
                     .unwrap_or_default()

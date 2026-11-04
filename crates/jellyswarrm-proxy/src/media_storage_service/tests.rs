@@ -1029,3 +1029,28 @@ async fn rebuilding_one_scope_does_not_move_another_scopes_source_routes() {
         .is_some());
     assert_no_foreign_key_violations(&pool).await;
 }
+
+#[test]
+fn home_feed_scopes_apply_only_to_their_viewer() {
+    for feed in ["latest", "nextup", "resume"] {
+        assert!(scope_applies_to_viewer(
+            &format!("{feed}:viewer:"),
+            "viewer"
+        ));
+        assert!(scope_applies_to_viewer(
+            &format!("{feed}:viewer:library"),
+            "viewer"
+        ));
+        assert!(!scope_applies_to_viewer(
+            &format!("{feed}:other:"),
+            "viewer"
+        ));
+        assert!(!scope_applies_to_viewer(
+            &format!("{feed}:viewer"),
+            "viewer"
+        ));
+    }
+    assert!(scope_applies_to_viewer("aggregate:show:viewer", "viewer"));
+    assert!(!scope_applies_to_viewer("nextup:show:other", "viewer"));
+    assert!(!scope_applies_to_viewer("unknown:viewer:", "viewer"));
+}
