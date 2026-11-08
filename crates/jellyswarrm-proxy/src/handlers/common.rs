@@ -548,6 +548,9 @@ mod tests {
             "ParentThumbItemId": "cccccccccccccccccccccccccccccccc",
             "ParentThumbImageTag": "dddddddddddddddddddddddddddddddd",
             "SeriesPrimaryImageTag": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "ParentPrimaryImageItemId": "21212121212121212121212121212121",
+            "ParentPrimaryImageTag": "24242424242424242424242424242424",
+            "ParentArtItemId": "25252525252525252525252525252525",
             "CanDelete": true,
             "CanDownload": true,
             "ImageTags": {
@@ -645,6 +648,26 @@ mod tests {
             .unwrap();
         assert_eq!(album_mapping.original_media_id, original_album_id);
         assert_eq!(album_mapping.server_id, server.id);
+        // Image owner IDs must be proxy IDs, or the client asks the proxy for
+        // an upstream ID it cannot route (blank episode cards on Recently Added).
+        for (field, original) in [
+            (
+                "ParentPrimaryImageItemId",
+                "21212121212121212121212121212121",
+            ),
+            ("ParentArtItemId", "25252525252525252525252525252525"),
+        ] {
+            let virtual_id = media_item[field].as_str().unwrap();
+            assert_ne!(virtual_id, original, "{field}");
+            let mapping = state
+                .media_storage
+                .get_media_mapping_by_virtual(virtual_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.original_media_id, original, "{field}");
+            assert_eq!(mapping.server_id, server.id, "{field}");
+        }
         assert_ne!(
             media_item["People"][0]["Id"].as_str(),
             Some(original_person_id)
