@@ -11,6 +11,18 @@ pub(crate) enum MediaScopeKind {
     Resume,
 }
 
+impl MediaScopeKind {
+    /// Per-viewer feeds (Recently Added, search, Continue Watching).
+    /// Their membership is a recent window that is only ever added to, never
+    /// an inventory that a complete scan could prune.
+    pub(crate) fn is_feed(self) -> bool {
+        matches!(
+            self,
+            MediaScopeKind::Latest | MediaScopeKind::Search | MediaScopeKind::Resume
+        )
+    }
+}
+
 /// Shared codec for persisted catalog keys and viewer-scoped reverse lookups.
 /// Keep the existing key layouts so published aggregate IDs remain usable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

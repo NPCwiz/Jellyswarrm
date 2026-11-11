@@ -1687,3 +1687,93 @@ async fn rebuilding_one_scope_does_not_move_another_scopes_source_routes() {
         .is_some());
     assert_no_foreign_key_violations(&pool).await;
 }
+
+#[tokio::test]
+async fn feed_scopes_expire_entries_that_left_the_feed_but_inventories_do_not() {
+    let (pool, service) = migrated_service().await;
+    let primary = create_test_server_with_url(&pool, "http://primary.example:8096").await;
+    let sibling = create_test_server_with_url(&pool, "http://sibling.example:8096").await;
+    let mut mappings = Vec::new();
+    for (item, server) in [
+        ("old", &primary),
+        ("old", &sibling),
+        ("new", &primary),
+        ("new", &sibling),
+    ] {
+        mappings.push(
+            service
+                .get_or_create_media_mapping(&item.into(), server)
+                .await
+                .unwrap(),
+        );
+    }
+    let snapshot = |server: &Server, observations: Vec<MediaObservation>| MediaCatalogSnapshot {
+        source_key: format!("{}:", server.id),
+        server_id: server.id,
+        complete: false,
+        observations,
+    };
+    let observe = |indexes: [usize; 2], tmdb: &str| {
+        [
+            snapshot(
+                &primary,
+                vec![tmdb_movie_observation(
+                    mappings[indexes[0]].virtual_media_id.as_str(),
+                    tmdb,
+                )],
+            ),
+            snapshot(
+                &sibling,
+                vec![tmdb_movie_observation(
+                    mappings[indexes[1]].virtual_media_id.as_str(),
+                    tmdb,
+                )],
+            ),
+        ]
+    };
+    for scope in ["resume:user:", "configured:library:user"] {
+        let generation = service.begin_media_reconciliation().await.unwrap();
+        let old = service
+            .reconcile_media_catalog(scope, generation, &observe([0, 1], "1"), false)
+            .await
+            .unwrap()[&mappings[0].virtual_media_id]
+            .virtual_media_id
+            .clone();
+        // The old entry was last shown long ago; only the new one is shown now.
+        sqlx::query("UPDATE movie_version_members SET observed_at = '2000-01-01 00:00:00'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let generation = service.begin_media_reconciliation().await.unwrap();
+        let groups = service
+            .reconcile_media_catalog(scope, generation, &observe([2, 3], "2"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            groups[&mappings[2].virtual_media_id].active_member_count, 2,
+            "{scope}"
+        );
+        let retained = service.get_media_version_group(&old).await.unwrap();
+        let old_members: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM movie_version_members member
+            JOIN movie_catalog_scopes scope ON scope.id = member.scope_id
+            WHERE scope.scope_key = ? AND member.media_mapping_id IN (?, ?)
+            "#,
+        )
+        .bind(scope)
+        .bind(mappings[0].id)
+        .bind(mappings[1].id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if scope.starts_with("resume:") {
+            assert!(retained.is_none(), "expired feed group must be retired");
+            assert_eq!(old_members, 0);
+        } else {
+            assert!(retained.is_some(), "inventories never expire by age");
+            assert_eq!(old_members, 2);
+        }
+    }
+    assert_no_foreign_key_violations(&pool).await;
+}
